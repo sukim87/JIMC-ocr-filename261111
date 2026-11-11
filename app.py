@@ -10,9 +10,10 @@ import numpy as np
 import pandas as pd
 import pypdfium2 as pdfium
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 VERSION = "V.261111"
+OCR_PATCH = "숫자 인식 전처리 적용"
 UPDATE_DATE = "2026-11-11"
 MAX_FILES = 5
 
@@ -51,26 +52,28 @@ def crop_required_area(img):
 def clean_and_fix_order_no(order_str):
     if not order_str:
         return ""
-    value = order_str.upper().strip()
-    if value.startswith(("PO", "P0", "MI")):
+    raw = re.sub(r"\s+", "", order_str.upper().strip())
+    if raw.startswith(("PO", "P0", "MI")) or any(x in raw for x in ("MATERIAL", "MATER1AL", "MATL")):
         return ""
-    if any(x in value for x in ("MATERIAL", "MATER1AL", "MATL")):
-        return ""
-    if value.startswith("ZNAJOB"):
-        return order_str.strip()
-    match = re.search(r"([MHXP][234][A-Za-z0-9\-_]+)", order_str, re.I)
+    if raw.startswith("ZNAJOB"):
+        return raw
+
+    match = re.search(r"([MHXP][A-Z0-9\-_]+)", raw, re.I)
     if not match:
         return ""
-    raw = match.group(1)
-    prefix, rest = raw[0].upper(), raw[1:]
-    parts = re.split(r"([\- _])", rest)
-    main = parts[0]
-    fixed = ""
-    table = {"O": "0", "Q": "0", "Z": "2", "I": "1", "L": "1", "S": "5", "B": "8"}
-    for idx, char in enumerate(main):
-        fixed += table.get(char.upper(), char) if idx < 6 else char
-    parts[0] = fixed
-    return prefix + "".join(parts)
+    value = match.group(1).rstrip("-_")
+
+    # 코드 전체를 숫자로 강제 변환하지 않는다. 첫 문자와 끝 영문(예: X240305HD)은 보존한다.
+    # 숫자가 위치하는 중간 구간에서만 OCR 혼동문자를 보정한다.
+    chars = list(value)
+    digit_map = {"O": "0", "Q": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8"}
+    for i in range(1, len(chars)):
+        if chars[i].isalpha():
+            prev_is_digitlike = i > 1 and (chars[i-1].isdigit() or chars[i-1] in digit_map)
+            next_is_digitlike = i+1 < len(chars) and (chars[i+1].isdigit() or chars[i+1] in digit_map)
+            if prev_is_digitlike and next_is_digitlike and chars[i] in digit_map:
+                chars[i] = digit_map[chars[i]]
+    return "".join(chars)
 
 
 def normalize_ocr_results(results):
@@ -175,12 +178,52 @@ def success_score(fields):
     return sum(bool(fields.get(key)) for key in ("order_no", "date", "po_no"))
 
 
+def preprocess_number_image(img):
+    """숫자/영문 코드 인식용 전처리: 2배 확대 + 회색조 + 대비/선명도 강화 + 자동 대비."""
+    gray = ImageOps.grayscale(img)
+    gray = gray.resize((max(1, gray.width * 2), max(1, gray.height * 2)), Image.LANCZOS)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.2, percent=170, threshold=2))
+    return gray
+
+
+def numeric_candidate_results(target, reader):
+    """원본 OCR이 핵심 숫자 필드를 놓쳤을 때만 전처리 OCR을 한 번 추가한다."""
+    enhanced = preprocess_number_image(target)
+    arr = np.asarray(enhanced, dtype=np.uint8)
+    try:
+        return reader.readtext(arr, detail=1, paragraph=False)
+    finally:
+        del arr, enhanced
+
+
+def merge_fields(primary, secondary):
+    merged = dict(primary)
+    for key in ("order_no", "date", "po_no"):
+        if not merged.get(key) and secondary.get(key):
+            merged[key] = secondary[key]
+    # 업체명은 기존 원본 OCR 결과를 우선하여 전처리 때문에 한글 인식 규칙이 흔들리지 않게 한다.
+    if not merged.get("vendor") and secondary.get("vendor"):
+        merged["vendor"] = secondary["vendor"]
+    return merged
+
+
 def run_ocr_once(img, reader, angle):
     rotated = img.rotate(angle, expand=True) if angle else img
     target = crop_required_area(rotated)
     array = np.asarray(target, dtype=np.uint8)
     results = reader.readtext(array)
     fields = extract_fields(results)
+
+    # 핵심 숫자 필드가 부족한 경우에만 숫자 인식용 전처리를 추가 적용한다.
+    # 정상 문서는 기존 1회 OCR로 끝나므로 속도 저하를 최소화한다.
+    if success_score(fields) < 3:
+        enhanced_results = numeric_candidate_results(target, reader)
+        enhanced_fields = extract_fields(enhanced_results)
+        fields = merge_fields(fields, enhanced_fields)
+        del enhanced_results, enhanced_fields
+
     del array, target, rotated, results
     return fields
 
