@@ -306,9 +306,6 @@ def main():
     st.info("💡 **사용 안내**  \n인수검사 완료 파일을 첨부한 후 **분석 시작**을 누르면 파일명을 자동 생성합니다.  \n📌 **파일명 생성 기준:** `수주번호_날짜_업체명_발주서번호`")
     st.markdown("---")
 
-    with st.spinner("OCR AI 모델을 준비 중입니다..."):
-        reader = load_ocr_reader()
-
     uploaded_files = st.file_uploader("PDF 또는 이미지 파일을 선택하세요 (최대 5개)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
     target_files = list(uploaded_files[:MAX_FILES]) if uploaded_files else []
     if uploaded_files and len(uploaded_files) > MAX_FILES:
@@ -326,6 +323,11 @@ def main():
         st.rerun()
 
     if analyze_clicked:
+        # EasyOCR는 앱 접속 시 로딩하지 않고 분석 버튼을 눌렀을 때만 초기화한다.
+        # 따라서 모델 다운로드/초기화가 느려도 앱 UI 자체는 먼저 정상 표시된다.
+        with st.spinner("OCR AI 모델을 준비 중입니다. 최초 실행은 모델 다운로드로 시간이 걸릴 수 있습니다..."):
+            reader = load_ocr_reader()
+
         results = []
         progress = st.progress(0.0)
         status = st.empty()
